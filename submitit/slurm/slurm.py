@@ -341,7 +341,7 @@ class SlurmExecutor(core.PicklingExecutor):
     @property
     def _submitit_command_str(self) -> str:
         return " ".join(
-            [shlex.quote(sys.executable), "-u -m submitit.core._submit", shlex.quote(str(self.folder)),]
+            ["-u -m submitit.core._submit", shlex.quote(str(self.folder)),]
         )
 
     def _make_submission_file_text(self, command: str, uid: str) -> str:
@@ -386,6 +386,7 @@ def _get_default_parameters() -> Dict[str, Any]:
 def _make_sbatch_string(
     command: str,
     folder: tp.Union[str, Path],
+    executable: tp.Optional[Path] = None,
     job_name: str = "submitit",
     partition: str = None,
     time: int = 5,
@@ -422,6 +423,8 @@ def _make_sbatch_string(
 
     folder: str/Path
         folder where print logs and error logs will be written
+    executable: str/Path/None
+        executable to use to execute the python command. If None, uses the currently executable
     signal_delay_s: int
         delay between the kill signal and the actual kill of the slurm job.
     setup: list
@@ -441,6 +444,7 @@ def _make_sbatch_string(
     """
     nonslurm = [
         "nonslurm",
+        "executable",
         "folder",
         "command",
         "map_count",
@@ -452,6 +456,8 @@ def _make_sbatch_string(
     # rename and reformat parameters
     parameters["signal"] = signal_delay_s
     del parameters["signal_delay_s"]
+    if executable is None:
+        executable = shlex.quote(sys.executable)
     if job_name:
         parameters["job_name"] = utils.sanitize(job_name)
     if comment:
@@ -493,6 +499,6 @@ def _make_sbatch_string(
         "",
         "# command",
         "export SUBMITIT_EXECUTOR=slurm",
-        f"srun --output {stdout} --error {stderr} --unbuffered {command}",
+        f"srun --output {stdout} --error {stderr} --unbuffered {executable} {command}",
     ]
     return "\n".join(lines)
