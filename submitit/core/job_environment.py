@@ -47,6 +47,14 @@ class JobEnvironment:
             n = n[: -len("JobEnvironment")]
         return n.lower()
 
+    @property
+    def paths(self) -> JobPaths:
+        """Provides the paths used by submitit, including
+        stdout, stderr, submitted_pickle and folder.
+        """
+        folder = os.environ["SUBMITIT_FOLDER"]
+        return JobPaths(folder, job_id=self.job_id, task_id=self.global_rank)
+
     def activated(self) -> bool:
         """Tests if we are running inside this environment.
 
@@ -86,32 +94,27 @@ class JobEnvironment:
 
     @property
     def num_tasks(self) -> int:
-        """Total number of tasks for the job
-        """
+        """Total number of tasks for the job"""
         return int(os.environ.get(self._env["num_tasks"], 1))
 
     @property
     def num_nodes(self) -> int:
-        """Total number of nodes for the job
-        """
+        """Total number of nodes for the job"""
         return int(os.environ.get(self._env["num_nodes"], 1))
 
     @property
     def node(self) -> int:
-        """Id of the current node
-        """
+        """Id of the current node"""
         return int(os.environ.get(self._env["node"], 0))
 
     @property
     def global_rank(self) -> int:
-        """Global rank of the task
-        """
+        """Global rank of the task"""
         return int(os.environ.get(self._env["global_rank"], 0))
 
     @property
     def local_rank(self) -> int:
-        """Local rank of the task, ie on the current node.
-        """
+        """Local rank of the task, ie on the current node."""
         return int(os.environ.get(self._env["local_rank"], 0))
 
     def __repr__(self) -> str:
@@ -131,7 +134,10 @@ class JobEnvironment:
         """
         handler = SignalHandler(self, paths, submission)
         signal.signal(signal.SIGUSR1, handler.checkpoint_and_try_requeue)
+        # A priori we don't need other signals anymore,
+        # but still log them to make it easier to debug.
         signal.signal(signal.SIGTERM, handler.bypass)
+        signal.signal(signal.SIGCONT, handler.bypass)
 
     # pylint: disable=no-self-use,unused-argument
     def _requeue(self, countdown: int) -> None:
@@ -169,17 +175,17 @@ class SignalHandler:
             )
         return timed_out
 
-    def bypass(
-        self, signum: signal.Signals, frame: types.FrameType = None  # pylint:disable=unused-argument
-    ) -> None:
-        self._logger.warning(f"Bypassing signal {signum}")
+    def bypass(self, signum: int, frame: types.FrameType = None) -> None:  # pylint:disable=unused-argument
+        self._logger.warning(f"Bypassing signal {signal.Signals(signum).name}")
 
     def checkpoint_and_try_requeue(
-        self, signum: signal.Signals, frame: types.FrameType = None  # pylint:disable=unused-argument
+        self, signum: int, frame: types.FrameType = None  # pylint:disable=unused-argument
     ) -> None:
         timed_out = self.has_timed_out()
         case = "timed-out" if timed_out else "preempted"
-        self._logger.warning(f"Caught signal {signum} on {socket.gethostname()}: this job is {case}.")
+        self._logger.warning(
+            f"Caught signal {signal.Signals(signum).name} on {socket.gethostname()}: this job is {case}."
+        )
 
         procid = self.env.global_rank
         if procid != 0:
@@ -207,7 +213,7 @@ class SignalHandler:
         self._exit()
 
     def checkpoint_and_exit(
-        self, signum: signal.Signals, frame: types.FrameType = None  # pylint:disable=unused-argument
+        self, signum: int, frame: types.FrameType = None  # pylint:disable=unused-argument
     ) -> None:
         # Note: no signal is actually bound to `checkpoint_and_exit` but this is used by plugins.
         self._logger.info(f"Caught signal {signal.Signals(signum).name} on {socket.gethostname()}")

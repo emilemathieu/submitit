@@ -17,7 +17,7 @@ from ..core import core, job_environment, logger, utils
 from ..core.core import R
 
 # pylint: disable-msg=too-many-arguments
-VALID_KEYS = {"timeout_min", "gpus_per_node", "tasks_per_node", "signal_delay_s"}
+VALID_KEYS = {"timeout_min", "gpus_per_node", "tasks_per_node", "signal_delay_s", "visible_gpus"}
 
 LOCAL_REQUEUE_RETURN_CODE = 144
 
@@ -68,21 +68,8 @@ class LocalJob(core.Job[R]):
         assert self._process is not None
         self._process.send_signal(signal.SIGINT)
 
-    def _interrupt(self, timeout: bool = False) -> None:
-        """Sends preemption or timeout signal to the job (for testing purpose)
-
-        Parameter
-        ---------
-        timedout: bool
-            Whether to trigger a job time-out (if False, it triggers preemption)
-        """
-        assert self._process is not None
-        if not timeout:
-            self._process.send_signal(signal.SIGTERM)
-            time.sleep(0.001)
-        self._process.send_signal(signal.SIGUSR1)
-
-    def trigger_timeout(self) -> None:
+    def _interrupt(self) -> None:
+        """Sends preemption / timeout signal to the job (for testing purpose)"""
         assert self._process is not None
         self._process.send_signal(signal.SIGUSR1)
 
@@ -145,6 +132,7 @@ class LocalExecutor(core.PicklingExecutor):
         Valid parameters are:
         - timeout_min (float)
         - gpus_per_node (int)
+        - visible_gpus (Sequence[int])
         - tasks_per_node (int)
         - nodes (int). Must be 1 if specified
         - signal_delay_s (int): USR1 signal delay before timeout
@@ -153,19 +141,33 @@ class LocalExecutor(core.PicklingExecutor):
         """
         if kwargs.get("nodes", 0) > 1:
             raise ValueError("LocalExecutor can use only one node. Use nodes=1")
+        gpus_requested = kwargs.get("gpus_per_node", 0)
+        visible_gpus = kwargs.get("visible_gpus", ())
+        if not isinstance(visible_gpus, Sequence):
+            raise ValueError(f"Provided visible_gpus={visible_gpus} is not an instance of Sequence.")
+        if not all(isinstance(x, int) for x in visible_gpus):
+            raise ValueError(f"Provided visible_gpus={visible_gpus} contains an element that is not an int.")
+        if len(visible_gpus) > 0 and gpus_requested > len(visible_gpus):
+            raise ValueError(
+                f"{gpus_requested} gpus requested, but only {visible_gpus} were specified visible."
+            )
         super()._internal_update_parameters(**kwargs)
 
     def _submit_command(self, command: str) -> LocalJob[R]:
         # Override this, because the implementation is simpler than for clusters like Slurm
         # Only one node is supported for local executor.
         ntasks = self.parameters.get("tasks_per_node", 1)
+        n_gpus = self.parameters.get("gpus_per_node", 0)
+        visible_gpus = self.parameters.get("visible_gpus", ())
+        gpus = range(n_gpus) if visible_gpus == () else visible_gpus[:n_gpus]
         process = start_controller(
             folder=self.folder,
             command=command,
             tasks_per_node=ntasks,
-            cuda_devices=",".join(str(k) for k in range(self.parameters.get("gpus_per_node", 0))),
+            cuda_devices=",".join(str(k) for k in gpus),
             timeout_min=self.parameters.get("timeout_min", 2.0),
             signal_delay_s=self.parameters.get("signal_delay_s", 30),
+            stderr_to_stdout=self.parameters.get("stderr_to_stdout", False),
         )
         job: LocalJob[R] = LocalJob(
             folder=self.folder, job_id=str(process.pid), process=process, tasks=list(range(ntasks))
@@ -203,6 +205,7 @@ def start_controller(
     cuda_devices: str = "",
     timeout_min: float = 5.0,
     signal_delay_s: int = 30,
+    stderr_to_stdout: bool = False,
 ) -> "subprocess.Popen['bytes']":
     """Starts a job controller, which is expected to survive the end of the python session."""
     env = dict(os.environ)
@@ -213,9 +216,12 @@ def start_controller(
         SUBMITIT_LOCAL_SIGNAL_DELAY_S=str(int(signal_delay_s)),
         SUBMITIT_LOCAL_NODEID="0",
         SUBMITIT_LOCAL_JOB_NUM_NODES="1",
+        SUBMITIT_STDERR_TO_STDOUT="1" if stderr_to_stdout else "",
         SUBMITIT_EXECUTOR="local",
-        CUDA_AVAILABLE_DEVICES=cuda_devices,
+        CUDA_VISIBLE_DEVICES=cuda_devices,
     )
+    # The LocalJob will be responsible to polling and ending this process.
+    # pylint: disable=consider-using-with
     process = subprocess.Popen(
         [sys.executable, "-m", "submitit.local._local", str(folder)], shell=False, env=env
     )
@@ -237,12 +243,12 @@ class Controller:
         self.command = shlex.split(os.environ["SUBMITIT_LOCAL_COMMAND"])
         self.timeout_s = int(os.environ["SUBMITIT_LOCAL_TIMEOUT_S"])
         self.signal_delay_s = int(os.environ["SUBMITIT_LOCAL_SIGNAL_DELAY_S"])
+        self.stderr_to_stdout = bool(os.environ["SUBMITIT_STDERR_TO_STDOUT"])
         self.tasks: List[subprocess.Popen] = []  # type: ignore
         self.stdouts: List[IO[Any]] = []
         self.stderrs: List[IO[Any]] = []
         self.pid = str(os.getpid())
         self.folder = Path(folder)
-        signal.signal(signal.SIGUSR1, self._forward_signal)
         signal.signal(signal.SIGTERM, self._forward_signal)
 
     def _forward_signal(self, signum: signal.Signals, *args: Any) -> None:  # pylint:disable=unused-argument
@@ -256,14 +262,14 @@ class Controller:
         self.folder.mkdir(exist_ok=True)
         paths = [utils.JobPaths(self.folder, self.pid, k) for k in range(self.ntasks)]
         self.stdouts = [p.stdout.open("a") for p in paths]
-        self.stderrs = [p.stderr.open("a") for p in paths]
+        self.stderrs = self.stdouts if self.stderr_to_stdout else [p.stderr.open("a") for p in paths]
         for k in range(self.ntasks):
             env = dict(os.environ)
             env.update(
                 SUBMITIT_LOCAL_LOCALID=str(k), SUBMITIT_LOCAL_GLOBALID=str(k), SUBMITIT_LOCAL_JOB_ID=self.pid
             )
             self.tasks.append(
-                subprocess.Popen(
+                subprocess.Popen(  # pylint: disable=consider-using-with
                     self.command,
                     shell=False,
                     env=env,

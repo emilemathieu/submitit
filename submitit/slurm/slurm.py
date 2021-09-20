@@ -47,7 +47,7 @@ class SlurmInfoWatcher(core.InfoWatcher):
         to_check = {x.split("_")[0] for x in self._registered - self._finished}
         if not to_check:
             return None
-        command = ["sacct", "-o", "JobID,State", "--parsable2"]
+        command = ["sacct", "-o", "JobID,State,NodeList", "--parsable2"]
         for jid in to_check:
             command.extend(["-j", str(jid)])
         return command
@@ -265,7 +265,7 @@ class SlurmExecutor(core.PicklingExecutor):
         params = super()._convert_parameters(params)
         # replace type in some cases
         if "mem" in params:
-            params["mem"] = f"{params['mem']}GB"
+            params["mem"] = _convert_mem(params["mem"])
         return params
 
     def _internal_update_parameters(self, **kwargs: Any) -> None:
@@ -388,29 +388,32 @@ def _make_sbatch_string(
     folder: tp.Union[str, Path],
     executable: tp.Optional[Path] = None,
     job_name: str = "submitit",
-    partition: str = None,
+    partition: tp.Optional[str] = None,
     time: int = 5,
     nodes: int = 1,
-    ntasks_per_node: int = 1,
+    ntasks_per_node: tp.Optional[int] = None,
     cpus_per_task: tp.Optional[int] = None,
     cpus_per_gpu: tp.Optional[int] = None,
     num_gpus: tp.Optional[int] = None,  # legacy
     gpus_per_node: tp.Optional[int] = None,
     gpus_per_task: tp.Optional[int] = None,
+    qos: tp.Optional[str] = None,  # quality of service
     setup: tp.Optional[tp.List[str]] = None,
     mem: tp.Optional[str] = None,
     mem_per_gpu: tp.Optional[str] = None,
     mem_per_cpu: tp.Optional[str] = None,
     signal_delay_s: int = 90,
-    comment: str = "",
-    constraint: str = "",
-    exclude: str = "",
-    gres: str = "",
-    exclusive: tp.Union[bool, str] = False,
+    comment: tp.Optional[str] = None,
+    constraint: tp.Optional[str] = None,
+    exclude: tp.Optional[str] = None,
+    gres: tp.Optional[str] = None,
+    exclusive: tp.Optional[tp.Union[bool, str]] = None,
     array_parallelism: int = 256,
     wckey: str = "submitit",
+    stderr_to_stdout: bool = False,
     map_count: tp.Optional[int] = None,  # used internally
     additional_parameters: tp.Optional[tp.Dict[str, tp.Any]] = None,
+    srun_args: tp.Optional[tp.Iterable[str]] = None,
 ) -> str:
     """Creates the content of an sbatch file with provided parameters
 
@@ -428,13 +431,15 @@ def _make_sbatch_string(
     signal_delay_s: int
         delay between the kill signal and the actual kill of the slurm job.
     setup: list
-        a list of command to run in sbatch befure running srun
+        a list of command to run in sbatch before running srun
     map_size: int
         number of simultaneous map/array jobs allowed
     additional_parameters: dict
         Forces any parameter to a given value in sbatch. This can be useful
         to add parameters which are not currently available in submitit.
         Eg: {"mail-user": "blublu@fb.com", "mail-type": "BEGIN"}
+    srun_args: List[str]
+        Add each argument in the list to the srun call
 
     Raises
     ------
@@ -451,11 +456,13 @@ def _make_sbatch_string(
         "array_parallelism",
         "additional_parameters",
         "setup",
+        "signal_delay_s",
+        "stderr_to_stdout",
+        "srun_args",
     ]
-    parameters = {x: y for x, y in locals().items() if y and y is not None and x not in nonslurm}
+    parameters = {k: v for k, v in locals().items() if v is not None and k not in nonslurm}
     # rename and reformat parameters
-    parameters["signal"] = signal_delay_s
-    del parameters["signal_delay_s"]
+    parameters["signal"] = f"USR1@{signal_delay_s}"
     if executable is None:
         executable = shlex.quote(sys.executable)
     if job_name:
@@ -480,25 +487,37 @@ def _make_sbatch_string(
         stdout = stdout.replace("%j", "%A_%a")
         stderr = stderr.replace("%j", "%A_%a")
     parameters["output"] = stdout.replace("%t", "0")
-    parameters["error"] = stderr.replace("%t", "0")
-    parameters.update({"signal": f"USR1@{signal_delay_s}", "open-mode": "append"})
+    if not stderr_to_stdout:
+        parameters["error"] = stderr.replace("%t", "0")
+    parameters["open-mode"] = "append"
     if additional_parameters is not None:
         parameters.update(additional_parameters)
     # now create
     lines = ["#!/bin/bash", "", "# Parameters"]
     lines += [
-        "#SBATCH --{}{}".format(x.replace("_", "-"), "" if parameters[x] is True else f"={parameters[x]}")
-        for x in sorted(parameters)
+        "#SBATCH --{}{}".format(k.replace("_", "-"), "" if parameters[k] is True else f"={parameters[k]}")
+        for k in sorted(parameters)
     ]
     # environment setup:
     if setup is not None:
         lines += ["", "# setup"] + setup
     # commandline (this will run the function and args specified in the file provided as argument)
     # We pass --output and --error here, because the SBATCH command doesn't work as expected with a filename pattern
+    stderr_flag = "" if stderr_to_stdout else f"--error {stderr}"
+    if srun_args is None:
+        srun_command = "srun"
+    else:
+        srun_command = f"srun {' '.join(srun_args)}"
     lines += [
         "",
         "# command",
         "export SUBMITIT_EXECUTOR=slurm",
-        f"srun --output {stdout} --error {stderr} --unbuffered {executable} {command}",
+        f"{srun_command} --output {stdout} {stderr_flag} --unbuffered {executable} {command}\n",
     ]
     return "\n".join(lines)
+
+
+def _convert_mem(mem_gb: float) -> str:
+    if mem_gb == int(mem_gb):
+        return f"{int(mem_gb)}GB"
+    return f"{int(mem_gb * 1024)}MB"

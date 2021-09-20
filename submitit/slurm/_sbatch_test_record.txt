@@ -6,7 +6,6 @@
 #SBATCH --exclusive
 #SBATCH --job-name=submitit
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
 #SBATCH --open-mode=append
 #SBATCH --output=/tmp/%j_0_log.out
 #SBATCH --partition=learnfair
@@ -16,4 +15,4 @@
 
 # command
 export SUBMITIT_EXECUTOR=slurm
-srun --output /tmp/%j_%t_log.out --error /tmp/%j_%t_log.err --unbuffered blublu
+srun -vv --cpu-bind none --output /tmp/%j_%t_log.out --error /tmp/%j_%t_log.err --unbuffered blublu
